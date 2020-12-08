@@ -1,0 +1,817 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+@module  update_conns_resrs
+@brief   update GUI csw browser connnections resources
+
+
+(C) 2020 by the GRASS Development Team
+This program is free software under the GNU General Public License
+(>=v2). Read the file COPYING that comes with GRASS for details.
+
+@author Tomas Zigo <tomas.zigo slovanet.sk>
+"""
+
+import argparse
+import http
+import io
+import os
+import urllib
+from urllib.request import (
+    ProxyHandler, Request, build_opener, install_opener, urlopen,
+)
+
+import lxml.etree
+
+from owslib.csw import CatalogueServiceWeb
+from owslib.ows import ExceptionReport
+
+from pyexcel_ods3 import get_data
+
+import validators
+
+
+class UrlValidationFailure(Exception):
+    pass
+
+
+class FilePathDoesNotExists(Exception):
+    pass
+
+
+class XmlValidationFailure(Exception):
+    pass
+
+
+class WrongHttpStatusCode(Exception):
+    pass
+
+
+class NotExistInternetConnection(Exception):
+    pass
+
+
+class CanNotOpenFile(Exception):
+    pass
+
+
+class WrongDownloadedFileFormat(Exception):
+    pass
+
+
+class BoolValueRequired(Exception):
+    pass
+
+
+class StrValueRequired(Exception):
+    pass
+
+
+class NotExpectedFileFormat(Exception):
+    pass
+
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+}
+
+HTTP_STATUS_CODES = list(http.HTTPStatus)
+
+
+def urlopen_(url, *args, **kwargs):
+    """Wrapper around urlopen. Same function as 'urlopen', but with the
+    ability to define headers.
+
+    :param str url: url address
+    """
+    request = Request(url, headers=HEADERS)
+    return urlopen(request, *args, **kwargs)
+
+
+def manage_proxies(proxies):
+    """Manage proxies
+
+    param: str proxies: proxies definition "http=<value>,ftp=<value>"
+    """
+    _proxies = {}
+    for ptype, purl in (p.split('=') for p in proxies.split(',')):
+        _proxies[ptype] = purl
+        proxy = ProxyHandler(_proxies)
+        opener = build_opener(proxy)
+        install_opener(opener)
+
+
+class UpdateConnectionsResources:
+    """Update connnections resources"""
+
+    filter_data_opts = [
+        'Addresses',
+        'Agriculture',
+        'Banking',
+        'BusinessPolitics',
+        'Chemicals',
+        'Criminality',
+        'Culture',
+        'Education',
+        'Environment',
+        'Food',
+        'Geospatial',
+        'Government',
+        'Grand Total',
+        'Health',
+        'IoT',
+        'Language',
+        'Legal',
+        'Meteo',
+        'NewsCadastre',
+        'Research',
+        'Social',
+        'Statistics',
+        'Taxation',
+        'Transportation',
+        'Utilities',
+        'Various',
+        'Weather',
+    ]
+    filter_data_opts += ['All']
+
+    def __init__(
+            self, url, conns_resrs_xml, conns_resrs_xsd,
+            filter_data='Geospatial', separator=': ',
+            active_service=True, valide_service=True, write=True,
+            not_valide_service=False, print_vert_space=True,
+            spreadsheets_file=None, not_active_service=False,
+    ):
+        self._url = url
+        self._conns_resrs_xsd = conns_resrs_xsd
+        self._conns_resrs_xml = conns_resrs_xml
+
+        self._filter_data = filter_data
+        self._active_service = active_service
+        self._not_active_service = not_active_service
+        self._valide_service = valide_service
+        self._not_valide_service = not_valide_service
+        self._write = write
+        self._separator = separator
+        self._print_vert_space = print_vert_space
+        self._spreadsheets_file = spreadsheets_file
+
+        self._file = None
+        self._file_data_key = 'API_Cases'
+        self._not_valid_urls = []
+        self._not_active_csw_urls = []
+
+        if not self._spreadsheets_file:
+            self._download_file()
+            self._read_file(file=self._file)
+        else:
+            self._read_file(file=self._spreadsheets_file)
+        self.get_data()
+
+    @property
+    def _url(self):
+        return self.__url
+
+    @_url.setter
+    def _url(self, url):
+        self._validate_url(url)
+        self.__url = url
+
+    @property
+    def _conns_resrs_xsd(self):
+        return self.__conns_resrs_xsd
+
+    @_conns_resrs_xsd.setter
+    def _conns_resrs_xsd(self, path):
+        if not os.path.exists(path):
+            raise FilePathDoesNotExists(
+                "Connnections resources xsd schema file '{}' "
+                "doesn't exists.".format(
+                    path,
+                ),
+            )
+        if not path.lower().endswith('.xsd'):
+            raise NotExpectedFileFormat(
+                "File '{}' is not xsd file (.xsd)".format(
+                    path,
+                ),
+            )
+        self.__conns_resrs_xsd = path
+
+    @property
+    def _conns_resrs_xml(self):
+        return self.__conns_resrs_xml
+
+    @_conns_resrs_xml.setter
+    def _conns_resrs_xml(self, path):
+        if not os.path.exists(path):
+            raise FilePathDoesNotExists(
+                "Connnections resources file '{}' "
+                "doesn't exists.".format(
+                    path,
+                ),
+            )
+        if not path.lower().endswith('.xml'):
+            raise NotExpectedFileFormat(
+                "File '{}' is not xml file (.xml)".format(
+                    path,
+                ),
+            )
+        self._validate_xml(xml=path)
+        self.__conns_resrs_xml = path
+
+    @property
+    def _filter_data(self):
+        return self.__filter_data
+
+    @_filter_data.setter
+    def _filter_data(self, value):
+        if value not in self.filter_data_opts:
+            raise BoolValueRequired(
+                "Param 'filter_data' arg require boolean value",
+            )
+        self.__filter_data = value
+
+    @property
+    def _active_service(self):
+        return self.__active_service
+
+    @_active_service.setter
+    def _active_service(self, value):
+        if not isinstance(value, bool):
+            raise BoolValueRequired(
+                "Param 'active_service' arg require boolean value",
+            )
+        self.__active_service = value
+
+    @property
+    def _not_active_service(self):
+        return self.__not_active_service
+
+    @_not_active_service.setter
+    def _not_active_service(self, value):
+        if not isinstance(value, bool):
+            raise BoolValueRequired(
+                "Param 'not_active_service' arg require boolean value",
+            )
+        self.__not_active_service = value
+
+    @property
+    def _valide_service(self):
+        return self.__valide_service
+
+    @_valide_service.setter
+    def _valide_service(self, value):
+        if not isinstance(value, bool):
+            raise BoolValueRequired(
+                "Param 'valide_service' arg require boolean value",
+            )
+        self.__valide_service = value
+
+    @property
+    def _not_valide_service(self):
+        return self.__not_valide_service
+
+    @_not_valide_service.setter
+    def _not_valide_service(self, value):
+        if not isinstance(value, bool):
+            raise BoolValueRequired(
+                "Param 'valide_service' arg require boolean value",
+            )
+        self.__not_valide_service = value
+
+    @property
+    def _separator(self):
+        return self.__separator
+
+    @_separator.setter
+    def _separator(self, value):
+        if not isinstance(value, str):
+            raise StrValueRequired(
+                "Param 'valide_service' arg require str value",
+            )
+        self.__separator = value
+
+    @property
+    def _print_vert_space(self):
+        return self.__print_vert_space
+
+    @_print_vert_space.setter
+    def _print_vert_space(self, value):
+        if not isinstance(value, bool):
+            raise StrValueRequired(
+                "Param 'print_vert_space' arg require boolean value",
+            )
+        self.__print_vert_space = value
+
+    @property
+    def _spreadsheets_file(self):
+        return self.__spreadsheets_file
+
+    @_spreadsheets_file.setter
+    def _spreadsheets_file(self, path):
+        if path:
+            if not os.path.exists(path):
+                raise FilePathDoesNotExists(
+                    "Speredsheets file '{}' "
+                    "doesn't exists.".format(
+                        path,
+                    ),
+                )
+            if not path.lower().endswith('.ods'):
+                raise NotExpectedFileFormat(
+                    "File '{}' is not spreadsheets file (.ods)".format(
+                        path,
+                    ),
+                )
+
+        self.__spreadsheets_file = path
+        self._file = path
+
+    # GetCSWLisOfCandidates
+    def _download_file(self):
+        try:
+            response = urlopen_(url=self._url)
+            if not response.code == 200:
+                index = HTTP_STATUS_CODES.index(response.code)
+                desc = HTTP_STATUS_CODES[index].description
+                raise WrongHttpStatusCode(
+                    "Download file from <{url}>, "
+                    "return status code {code}, "
+                    "{desc}".format(
+                        url=self._url,
+                        code=response.code,
+                        desc=desc,
+                    ),
+                )
+            if response.getheader('Content-Type') != \
+               'application/vnd.oasis.opendocument.spreadsheet':
+                raise WrongDownloadedFileFormat(
+                    "Wrong downloaded file format. "
+                    "Check url < {} >. Allowed file format is "
+                    "OpenDocument Format (ODF) with .ods extension "
+                    "- a spreadsheet file".format(
+                        self._url,
+                        ),
+                    )
+
+            if not self._file:
+                self._file = io.BytesIO()
+                self._file.write(response.read())
+            # try:
+            #     with TemporaryFile() as temp_file:
+            #         with open(temp_file, 'wb') as f:
+            #             f.write(response.read())
+
+            # except IOError as err:
+            #     raise CanNotOpenFile(
+            #         "Can't open downloaded file, {}".format(
+            #             err,
+            #             ),
+            #         )
+
+        except urllib.error.HTTPError as err:
+            raise WrongHttpStatusCode(
+                "Download file from <{url}>, "
+                " return status code {code}, ".format(
+                    url=self._url,
+                    code=err,
+                    ),
+                )
+        except urllib.error.URLError:
+            raise NotExistInternetConnection(
+                "Download file from <{url}>, "
+                " failed. Check internet connection.".format(
+                    url=self._url,
+                    ),
+                )
+
+    def _is_multiple_url(self, url):
+        if url.count('\n') > 1:
+            return True
+        return False
+
+    def _handle_multiple_url(self, url):
+        if self._is_multiple_url(url):
+            for u in url.split('\n'):
+                if ('https' or 'http') in u:
+                    validated_url = self._validate_url(
+                        url=u.strip(),
+                        add_url=True,
+                    )
+                    if validated_url:
+                        self._active_service(
+                            url=u.strip(),
+                            add_url=True,
+                        )
+        else:
+            validated_url = self._validate_url(url.strip(), add_url=True)
+
+            if validated_url:
+                self._is_active_service(url, add_url=True)
+
+    def _validate_url(self, url, add_url=False):
+        if isinstance(
+                validators.url(url),
+                validators.ValidationFailure,
+        ):
+            if add_url:
+                print(f"NOT VALID {url}")
+                self._not_valid_urls.append(url)
+            else:
+                raise UrlValidationFailure(
+                    "Validation url < {} > failure".format(url),
+                )
+        else:
+            return url
+
+
+    def _validate_xml(self, xml):
+        xsd = lxml.etree.parse(self._conns_resrs_xsd)
+        xml_schema = lxml.etree.XMLSchema(xsd)
+        if not xml_schema.validate(lxml.etree.parse(xml)):
+            raise XmlValidationFailure(
+                "Connnections resources xml file '{}' "
+                "is not valid.".format(
+                    xml,
+                ),
+            )
+
+    def _validate_xml_at_parse_time(self, xml_string):
+        xsd = lxml.etree.parse(self._conns_resrs_xsd)
+        xml_schema = lxml.etree.XMLSchema(xsd)
+        parser = lxml.etree.XMLParser(schema=xml_schema)
+        try:
+            lxml.etree.fromstring(xml_string, parser)
+        except lxml.etree.XMLSyntaxError:
+            raise XmlValidationFailure(
+                "Can't parse connection xml item string '{}'. "
+                "Xml string is not valid.".format(
+                    xml_string,
+                ),
+            )
+
+    def _get_root_tag(self, root):
+        return "<{tag} version=\"1.0\">{csw_element}</{tag}>"
+
+    def _read_file(self, file):
+        self.data = get_data(file, start_row=1)
+
+    def _is_active_service(self, url, add_url=False):
+        # response = urlopen_(url=url)
+        # if not response.code == 200:
+        #     return False
+        # return True
+        try:
+            CatalogueServiceWeb(url, timeout=10)
+            return True
+        except ExceptionReport as err:
+            msg = "Error connecting to csw: {}, {}".format(err, url)
+        except ValueError as err:
+            msg = "Value Error: {}, {}".format(err, url)
+        except Exception as err:
+            msg = 'Unknown Error: {}, {}'.format(err, url)
+        # print(msg)
+        if add_url:
+            self._not_active_csw_urls.append(url)
+        return False
+
+    def _get_data_row(self, row, print_or_write):
+        """
+
+        param: list row: row with data
+
+        row[0] column -> API Country or type of provider*
+        row[1] column -> API Provider*
+        row[2] column -> Name Id*
+        row[3] column -> Short description*
+        row[4] column -> API URL (endpoint or link to documentation)*
+        row[5] column -> Type of API*
+        row[6] column -> Number of API (approx)*
+        row[7] column -> Theme(s)*
+        row[8] column -> Governmental Level*
+        row[9] column -> Country code*
+        row[10] column -> Source*
+
+        """
+        n = 1
+        if self._is_multiple_url(row[5]):
+            # Handle multiple urls (same item name wit diff prefix number)
+            for u in row[5].split('\n'):
+                if 'http' in u or 'https' in u:
+                    data_row = self. _get_data_format().format(
+                        country=row[1],
+                        govermental_level=row[8],
+                        api_provider=row[2],
+                        separator=self._separator,
+                        url=u.strip(),
+                    )
+                    data_row = "{}. ".format(n) + data_row
+                    print_or_write(data_row)
+                    n += 1
+        else:
+            data_row = self. _get_data_format().format(
+                country=row[1],
+                govermental_level=row[8],
+                api_provider=row[2],
+                separator=self._separator,
+                url=row[5].strip(),
+            )
+            print_or_write(data_row)
+
+    def _write_data(self, row):
+        self._get_data_row(
+            row=row,
+            print_or_write=self. _write_csw_conn_element,
+        )
+
+    def _make_xpath_query(self, **kwargs):
+        result = []
+        for n, u in kwargs.items():
+            result.append("[@{name}='{url}']".format(name=n, url=u))
+        return ''.join(result)
+
+    def _csw_conn_exist(self, root, **kwargs):
+        if root.xpath("//csw{}".format(self._make_xpath_query(**kwargs))):
+            return True
+        return False
+
+    def _write_csw_conn_element(self, data_row):
+        def write():
+            st = lxml.etree.Element("csw", name=name, url=url)
+            self._validate_xml_at_parse_time(
+                xml_string=self._get_root_tag(root).format(
+                    tag=root.tag,
+                    csw_element=lxml.etree.tostring(st).decode(),
+                ),
+            )
+            root.append(st)
+            tree.write(self._conns_resrs_xml, pretty_print=True)
+
+        parser = lxml.etree.XMLParser(remove_blank_text=True)
+        tree = lxml.etree.parse(self._conns_resrs_xml, parser)
+        root = tree.getroot()
+        name, url = self._split_data_row(data_row)
+
+        if not self._csw_conn_exist(root, name=name, url=url):
+            if self._valide_service:
+                # Check if url is valid
+                if url not in self._not_valid_urls and \
+                   url not in self._not_valid_urls:
+                    write()
+            else:
+                write()
+
+    def _get_data_format(self):
+        """
+        """
+        return (
+            "{country}, "
+            "{govermental_level}, "
+            "{api_provider}{separator}"
+            "{url}"
+        )
+
+    def _split_data_row(self, row):
+        if 'https' in row:
+            url_start = row.index('https')
+            name = row[:url_start - len(self._separator)]
+            url = row[url_start:]
+        elif 'http' in row:
+            url_start = row.index('http')
+            name = row[:url_start - len(self._separator)]
+            url = row[url_start:]
+        return name, url
+
+    def _print_csw_conn_element(self, row):
+        """Print service candicates list
+
+        param: list row: row with data
+       """
+        if self._print_vert_space:
+            row_format = "{}\n"
+        else:
+            row_format = "{}"
+
+        name, url = self._split_data_row(row)
+        if self._valide_service:
+            if url not in self._not_valid_urls:
+                print(row_format.format(row))
+        elif self._not_valide_service:
+            if url in self._not_valid_urls:
+                print(row_format.format(row))
+        else:
+            if self._active_service:
+                if self._valide_service:
+                    if url not in self._not_valid_urls and \
+                       url not in self._not_active_csw_urls:
+                        print(row_format.format(row))
+
+                # # print(url, self._not_active_csw_urls)
+                # if url not in self._not_active_csw_urls:
+                #     print(row_format.format(row))
+            elif self._not_active_service:
+                if url in self._not_active_csw_urls:
+                    print(row_format.format(row))
+            else:
+                # Print all service
+                print(row_format.format(row))
+
+    def _print_data(self, row):
+        self._get_data_row(
+            row=row,
+            print_or_write=self._print_csw_conn_element,
+        )
+
+    def _print_or_write_data(self, row):
+        if self._write:
+            self._write_data(row)
+        else:
+            self._print_data(row)
+
+    def get_data(self):
+        """
+        """
+        if self._filter_data == 'All':
+            for row in self.data[self._file_data_key]:
+                if row:
+                    # Url validation
+                    self._handle_multiple_url(url=row[5])
+                    self._print_or_write_data(row)
+                    # if self._active_service:
+                    #     # Check if url is active
+                    #     if self._is_active_service(url=row[5]):
+                    #         self._print_or_write_data(row)
+                    #     continue
+                    # self._print_or_write_data(row)
+                    # else:
+                    #     self._print_or_write_data(row)
+        else:
+            for row in self.data[self._file_data_key]:
+                if row:
+                    if row[8] == self._filter_data:
+                        # Url validation
+                        self._handle_multiple_url(url=row[5])
+                        self._print_or_write_data(row)
+                        # if self._active_service:
+                            # Check if url is active
+                            # if self._is_active_service(url=row[5]):
+                            #     self._print_or_write_data(row)
+                            # continue
+                        # self._print_or_write_data(row)
+                        # else:
+                        #    self._print_or_write_data(row)
+
+
+def file_path(path):
+    if os.path.isfile(path):
+        return path
+    else:
+        raise FilePathDoesNotExists(
+            "File path '{}' doesn't exist".format(
+                path,
+            ),
+        )
+
+
+def url_path(url):
+    if isinstance(
+            validators.url(url),
+            validators.ValidationFailure,
+    ):
+        raise UrlValidationFailure(
+            "Validation url < {} > failure".format(url),
+        )
+    return url
+
+
+def cmd_arg_parse():
+    parser = argparse.ArgumentParser()
+    file_group = parser.add_mutually_exclusive_group()
+    csw_active_not_active_group = parser.add_mutually_exclusive_group()
+    csw_valid_not_valid_group = parser.add_mutually_exclusive_group()
+
+    url = ('https://jeodpp.jrc.ec.europa.eu/ftp/jrc-opendata/APIS4DGOV/'
+           'cases/LATEST/API-cases.ods')
+    connections_resources_xml = os.path.join(
+        os.path.dirname(__file__),
+        'config',
+        'connections_resources_bckp.xml',
+    )
+    connections_resources_xsd = os.path.join(
+        os.path.dirname(__file__),
+        'config',
+        'connections_resources.xsd',
+    )
+
+    csw_active_not_active_group.add_argument(
+        '-a',
+        action='store_true',
+        help=('Print or write all active connections resources only'),
+    )
+    csw_active_not_active_group.add_argument(
+        '-i',
+        action='store_true',
+        help=('Print or write all not active connections resources only'),
+    )
+    csw_valid_not_valid_group.add_argument(
+        '-v',
+        action='store_true',
+        help=(
+            'Print or write all valid connections resources urls'
+        ),
+    )
+    csw_valid_not_valid_group.add_argument(
+        '-n',
+        action='store_true',
+        help=(
+            'Print all not valide connections resources urls'
+        ),
+    )
+    parser.add_argument(
+        '-p',
+        action='store_false',
+        help=(
+            'Print new connections resources only with following format '
+            '"{Country}, {Govermental level}, {Api provider}: {Url}"'
+        ),
+    )
+    parser.add_argument(
+        '-s',
+        action='store_false',
+        help=(
+            'Printing line without one line space'
+        ),
+    )
+    file_group.add_argument(
+        '--url',
+        type=url_path,
+        default=url,
+        help='Url of downloaded .ods file (default: \'%(default)s\')',
+    )
+    parser.add_argument(
+        '--xml',
+        type=file_path,
+        default=connections_resources_xml,
+        help=(
+            'Connections resources xml file path '
+            '(default: \'%(default)s\')'
+        ),
+    )
+    parser.add_argument(
+        '--xsd',
+        type=file_path,
+        default=connections_resources_xsd,
+        help=(
+            'Connections resources xdd schema file path '
+            '(default: \'%(default)s\')'
+        ),
+    )
+    parser.add_argument(
+        '--level',
+        default='Geospatial',
+        const='Geospatial',
+        nargs='?',
+        choices=UpdateConnectionsResources.filter_data_opts,
+        help='Govermental level (default: \'%(default)s\')',
+    )
+    parser.add_argument(
+        '--sep',
+        type=str,
+        default=': ',
+        help='Printing separator {Service name}{Separator}{Url}',
+    )
+    file_group.add_argument(
+        '--spreadsheets',
+        type=file_path,
+        help=(
+            'Connections resources spreadsheets ods file path'
+        ),
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    # manage_proxies
+    cmd_args = cmd_arg_parse()
+
+    UpdateConnectionsResources(
+        url=cmd_args.url,
+        conns_resrs_xml=cmd_args.xml,
+        conns_resrs_xsd=cmd_args.xsd,
+        filter_data=cmd_args.level,
+        separator=cmd_args.sep,
+        active_service=cmd_args.a,
+        not_active_service=cmd_args.i,
+        valide_service=cmd_args.v,
+        not_valide_service=cmd_args.n,
+        write=cmd_args.p,
+        print_vert_space=cmd_args.s,
+        spreadsheets_file=cmd_args.spreadsheets,
+    )
+
+
+if __name__ == "__main__":
+    main()
